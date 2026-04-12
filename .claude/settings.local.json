@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(python3 -c \"import anthropic, pydantic, fastapi, uvicorn, aiohttp, networkx; print\\('All imports OK'\\)\")",
+      "Bash(python3 -c ':*)",
+      "Bash(python3 -m uvicorn backend.main:app --host 0.0.0.0 --port 8000)",
+      "Bash(curl -s http://localhost:8000/runs)",
+      "Bash(python3 -m json.tool)",
+      "Bash(pkill -f \"uvicorn backend.main\")",
+      "Bash(curl -s http://localhost:8000/)",
+      "Bash(python3 -c \"from backend.models import FeatureBrief, Theme, PowerQuote; print\\('models OK'\\)\")",
+      "Bash(python3 -c \"from backend.agents import run_pipeline, _run_agent_loop; print\\('agents OK'\\)\")",
+      "Bash(python3 -c \"from backend.main import app; print\\('App loads OK'\\)\")",
+      "WebFetch(domain:www.duolingo.com)",
+      "WebSearch",
+      "Bash(curl -sI https://www.duolingo.com/favicon.ico)",
+      "Bash(curl -sL https://www.duolingo.com)",
+      "Bash(curl -sI https://d35aaqx5ub95lt.cloudfront.net/favicon.ico)",
+      "Bash(curl -sI https://d35aaqx5ub95lt.cloudfront.net/images/duolingo-touch-icon2.png)",
+      "Bash(curl -sI https://www.duolingo.com/images/facebook/duo-08523a2.jpg)",
+      "Bash(python3 -c \"from backend.main import app; from backend.models import FeatureBrief; from backend.agents import run_pipeline; print\\('All imports OK'\\)\")",
+      "Bash(curl -sL \"https://d35aaqx5ub95lt.cloudfront.net/images/duolingo-touch-icon2.png\" -o /Users/prats/Desktop/Duolingo/frontend/duo-logo.png)",
+      "Bash(curl -sL \"https://www.duolingo.com/images/facebook/duo200.png\" -o /Users/prats/Desktop/Duolingo/frontend/duo-logo.png)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8000/static/duo-logo.png)",
+      "Bash(curl -s http://localhost:8000/status/87f044c5-4a62-493e-8616-c7252087e9bc)"
+    ]
+  }
+}
