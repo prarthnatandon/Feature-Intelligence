@@ -1,21 +1,14 @@
 """
 Multi-agent pipeline for Product Feature Intelligence.
 
-Phase 1 — 4 specialist agents run in TWO WAVES via asyncio.gather():
-    Wave 1: ThemeAgent + QuoteAgent (independent — run in parallel)
-    Wave 2: AIFeasibilityAgent + GapAgent (depend on theme output)
+Phase 1 — 4 specialist agents run IN PARALLEL via asyncio.gather():
+    ThemeAgent, AIFeasibilityAgent, GapAgent, QuoteAgent
 
 Phase 2 — Orchestrator with extended thinking synthesizes all 4 outputs
            into a Feature Opportunity Brief.
 
-RAG Integration:
-    All agents use AgentRetriever to get semantically relevant feedback
-    instead of raw context-stuffing. Vector store is built once from the
-    FeedbackBundle and shared across all agents.
-
-Cost Tracking:
-    Every API call is recorded via CostTracker. Token usage and estimated
-    dollar costs are surfaced per agent and in aggregate.
+All progress is streamed to the caller via an async queue (SSE events).
+Works for any company — CompanyContext is threaded through all stages.
 """
 
 from __future__ import annotations
@@ -23,14 +16,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import time
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 import anthropic
 
-from backend.cost_tracker import CostTracker
 from backend.models import (
     AIFeasibility,
     BriefSection,
@@ -56,12 +47,6 @@ from backend.prompts import (
     quote_agent_system,
     theme_agent_system,
 )
-from backend.rag import (
-    AgentRetriever,
-    FeedbackVectorStore,
-    RetrievalMetrics,
-    build_vector_store,
-)
 
 logger = logging.getLogger(__name__)
 MODEL = "claude-sonnet-4-6"
@@ -71,7 +56,7 @@ _api_semaphore = asyncio.Semaphore(2)
 
 
 # ===========================================================================
-# Tool definitions (unchanged — same as original)
+# Tool definitions
 # ===========================================================================
 
 THEME_TOOLS = [
@@ -93,7 +78,7 @@ THEME_TOOLS = [
                 },
                 "user_segment": {
                     "type": "string",
-                    "description": "Which user segment feels this most acutely",
+                    "description": "Which user segment feels this most acutely (e.g. 'intermediate learners', 'Max subscribers')",
                 },
             },
             "required": ["theme_name", "description", "example_quotes", "frequency_estimate", "user_segment"],
@@ -106,8 +91,8 @@ THEME_TOOLS = [
             "type": "object",
             "properties": {
                 "total_feedback_items": {"type": "integer"},
-                "dominant_frustration": {"type": "string"},
-                "dominant_desire": {"type": "string"},
+                "dominant_frustration": {"type": "string", "description": "The #1 pain point across all feedback"},
+                "dominant_desire": {"type": "string", "description": "The #1 thing users most want"},
             },
             "required": ["total_feedback_items", "dominant_frustration", "dominant_desire"],
         },
@@ -126,10 +111,21 @@ FEASIBILITY_TOOLS = [
                     "type": "number", "minimum": 0, "maximum": 1,
                     "description": "0=AI can't help, 1=AI is the perfect solution",
                 },
-                "ai_approach": {"type": "string", "description": "Specific AI technique"},
-                "why_ai_uniquely_suited": {"type": "string"},
-                "technical_complexity": {"type": "string", "enum": ["low", "medium", "high"]},
-                "comparable_product": {"type": "string"},
+                "ai_approach": {
+                    "type": "string",
+                    "description": "Specific AI technique (e.g. 'conversational LLM with user history RAG')",
+                },
+                "why_ai_uniquely_suited": {
+                    "type": "string",
+                    "description": "Why AI specifically, vs. content work or human tutors?",
+                },
+                "technical_complexity": {
+                    "type": "string", "enum": ["low", "medium", "high"],
+                },
+                "comparable_product": {
+                    "type": "string",
+                    "description": "Product that already does something similar (competitor or adjacent)",
+                },
             },
             "required": ["theme_name", "feasibility_score", "ai_approach",
                          "why_ai_uniquely_suited", "technical_complexity", "comparable_product"],
@@ -152,19 +148,36 @@ FEASIBILITY_TOOLS = [
 GAP_TOOLS = [
     {
         "name": "record_gap",
-        "description": "Record a gap between what users need and what the company currently offers.",
+        "description": "Record a gap between what users need and what Duolingo currently offers.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "theme_name": {"type": "string"},
-                "gap_type": {"type": "string", "enum": ["missing_entirely", "partial_solution", "poor_execution"]},
-                "existing_feature": {"type": "string"},
-                "gap_description": {"type": "string"},
-                "market_evidence": {"type": "string"},
-                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                "gap_type": {
+                    "type": "string",
+                    "enum": ["missing_entirely", "partial_solution", "poor_execution"],
+                },
+                "existing_feature": {
+                    "type": "string",
+                    "description": "Name the closest existing product feature that addresses this, or empty string if none",
+                },
+                "gap_description": {
+                    "type": "string",
+                    "description": "Specifically what is missing from the current solution",
+                },
+                "market_evidence": {
+                    "type": "string",
+                    "description": "Competitor or precedent that proves this gap is real and solvable",
+                },
+                "confidence": {
+                    "type": "string",
+                    "enum": ["high", "medium", "low"],
+                    "description": "How confident are you this is a real gap? 'high' = you are certain the feature doesn't exist or is severely lacking; 'medium' = likely a gap but uncertain; 'low' = possible gap, unverified",
+                },
                 "knowledge_basis": {
                     "type": "string",
                     "enum": ["user_provided_features", "llm_knowledge", "user_feedback_only"],
+                    "description": "What is your knowledge of this gap based on? 'user_provided_features' = user pasted a feature list; 'llm_knowledge' = your training data; 'user_feedback_only' = users complain but you don't know the current feature set",
                 },
             },
             "required": ["theme_name", "gap_type", "existing_feature",
@@ -179,7 +192,7 @@ GAP_TOOLS = [
             "properties": {
                 "feature_name": {"type": "string"},
                 "why_users_love_it": {"type": "string"},
-                "quote": {"type": "string"},
+                "quote": {"type": "string", "description": "A user quote expressing love for this feature"},
             },
             "required": ["feature_name", "why_users_love_it", "quote"],
         },
@@ -190,8 +203,8 @@ GAP_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "biggest_gap": {"type": "string"},
-                "quick_win": {"type": "string"},
+                "biggest_gap": {"type": "string", "description": "The most significant unaddressed gap"},
+                "quick_win": {"type": "string", "description": "The gap that could be closed fastest"},
             },
             "required": ["biggest_gap", "quick_win"],
         },
@@ -207,8 +220,11 @@ QUOTE_TOOLS = [
             "properties": {
                 "quote_text": {"type": "string"},
                 "source": {"type": "string", "enum": ["reddit", "app_store", "seed"]},
-                "theme": {"type": "string"},
-                "why_compelling": {"type": "string"},
+                "theme": {"type": "string", "description": "Which theme does this quote represent?"},
+                "why_compelling": {
+                    "type": "string",
+                    "description": "Why is this quote particularly powerful for a product team?",
+                },
             },
             "required": ["quote_text", "source", "theme", "why_compelling"],
         },
@@ -240,7 +256,10 @@ ORCHESTRATOR_TOOLS = [
                              "competitive_context", "recommended_next_feature", "methodology"],
                 },
                 "title": {"type": "string"},
-                "content": {"type": "string", "description": "Polished markdown prose (200-500 words)"},
+                "content": {
+                    "type": "string",
+                    "description": "Polished markdown prose for this section (200-500 words)",
+                },
                 "supporting_quotes": {
                     "type": "array", "items": {"type": "string"},
                     "description": "2-4 user quotes that support this section",
@@ -262,11 +281,11 @@ ORCHESTRATOR_TOOLS = [
                         "properties": {
                             "rank": {"type": "integer"},
                             "feature_name": {"type": "string"},
-                            "one_liner": {"type": "string"},
+                            "one_liner": {"type": "string", "description": "One sentence: what this feature does"},
                             "evidence_strength": {"type": "string", "enum": ["strong", "moderate", "emerging"]},
                             "ai_uniqueness": {"type": "string", "enum": ["high", "medium", "low"]},
                             "effort_estimate": {"type": "string", "enum": ["quick_win", "medium_lift", "major_investment"]},
-                            "supporting_quote": {"type": "string"},
+                            "supporting_quote": {"type": "string", "description": "Best user quote for this opportunity"},
                         },
                         "required": ["rank", "feature_name", "one_liner", "evidence_strength",
                                      "ai_uniqueness", "effort_estimate", "supporting_quote"],
@@ -278,13 +297,22 @@ ORCHESTRATOR_TOOLS = [
     },
     {
         "name": "finalize_brief",
-        "description": "Called once all sections and rankings are done.",
+        "description": "Called once all sections and rankings are done. Provide the headline and call to action.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "headline_insight": {"type": "string"},
-                "top_3_insights": {"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 3},
-                "call_to_action": {"type": "string"},
+                "headline_insight": {
+                    "type": "string",
+                    "description": "The single most important finding — 1-2 sentences that would open a board presentation",
+                },
+                "top_3_insights": {
+                    "type": "array", "items": {"type": "string"},
+                    "minItems": 3, "maxItems": 3,
+                },
+                "call_to_action": {
+                    "type": "string",
+                    "description": "What should the product team do first, concretely?",
+                },
             },
             "required": ["headline_insight", "top_3_insights", "call_to_action"],
         },
@@ -293,7 +321,7 @@ ORCHESTRATOR_TOOLS = [
 
 
 # ===========================================================================
-# Core agentic loop — now with cost tracking
+# Core agentic loop (reused pattern)
 # ===========================================================================
 
 async def _run_agent_loop(
@@ -303,13 +331,14 @@ async def _run_agent_loop(
     user_message: str,
     tools: List[Dict],
     event_queue: asyncio.Queue,
-    cost_tracker: Optional[CostTracker] = None,
     max_iterations: int = 20,
     on_tool_call: Optional[Callable] = None,
 ) -> Dict[str, Any]:
     """
-    Generic agentic tool-use loop with cost tracking.
+    Generic agentic tool-use loop.
     Returns dict of {tool_name: [list of inputs collected]}.
+    Emits SSE events throughout.
+    on_tool_call: optional async callable(tool_name, tool_input) for custom side-effects.
     """
     messages = [{"role": "user", "content": user_message}]
     collected: Dict[str, list] = defaultdict(list)
@@ -320,7 +349,6 @@ async def _run_agent_loop(
     while iterations < max_iterations:
         iterations += 1
 
-        t0 = time.perf_counter()
         async with _api_semaphore:
             response = await client.messages.create(
                 model=MODEL,
@@ -330,11 +358,6 @@ async def _run_agent_loop(
                 tool_choice={"type": "auto"},
                 messages=messages,
             )
-        duration_ms = (time.perf_counter() - t0) * 1000
-
-        # Track cost
-        if cost_tracker:
-            cost_tracker.record(agent_name, response, MODEL, duration_ms)
 
         messages.append({"role": "assistant", "content": response.content})
 
@@ -346,8 +369,10 @@ async def _run_agent_loop(
             if block.type == "tool_use":
                 collected[block.name].append(block.input)
                 await event_queue.put(SSEEvent(
-                    type="agent_tool_call", agent=agent_name,
-                    tool=block.name, tool_input=block.input,
+                    type="agent_tool_call",
+                    agent=agent_name,
+                    tool=block.name,
+                    tool_input=block.input,
                 ))
                 if on_tool_call:
                     await on_tool_call(block.name, block.input)
@@ -367,45 +392,45 @@ async def _run_agent_loop(
 
 
 # ===========================================================================
-# Specialist agents — now with RAG retrieval
+# Specialist agents
 # ===========================================================================
+
+def _feedback_to_text(bundle: FeedbackBundle, max_items: int = 120) -> str:
+    """Serialize feedback items into a compact string for Claude context."""
+    lines = []
+    # Sort by upvotes descending so most-voted appear first
+    sorted_items = sorted(bundle.items, key=lambda x: x.upvotes, reverse=True)
+    for item in sorted_items[:max_items]:
+        prefix = f"[{item.source.upper()}" + (f" +{item.upvotes}" if item.upvotes else "") + "] "
+        lines.append(prefix + item.text)
+    return "\n\n".join(lines)
+
 
 async def run_theme_agent(
     client: anthropic.AsyncAnthropic,
     bundle: FeedbackBundle,
     company: CompanyContext,
     event_queue: asyncio.Queue,
-    retriever: Optional[AgentRetriever] = None,
-    cost_tracker: Optional[CostTracker] = None,
 ) -> ThemeAnalysis:
-    """
-    ThemeAgent — identifies unmet need clusters.
-    With RAG: uses semantically diverse retrieval instead of truncated dump.
-    """
-    if retriever:
-        feedback_text = retriever.for_theme_agent(company, max_items=150)
-        retrieval_note = " (RAG-retrieved: semantically diverse sample)"
-    else:
-        feedback_text = _feedback_to_text(bundle, max_items=120)
-        retrieval_note = ""
+    feedback_text = _feedback_to_text(bundle, max_items=120)
 
-    user_msg = (
-        f"Analyze this batch of {bundle.total} user feedback items about "
-        f"{company.company_name} ({company.product_description}).{retrieval_note}\n"
-        f"Identify 8–12 distinct unmet need themes. For each, call record_theme.\n"
-        f"End with emit_theme_summary.\n\n"
-        f"FEEDBACK:\n{feedback_text}"
-    )
+    user_msg = f"""Analyze this batch of {bundle.total} user feedback items about {company.company_name} ({company.product_description}).
+Identify 8–12 distinct unmet need themes. For each, call record_theme.
+End with emit_theme_summary.
+
+FEEDBACK:
+{feedback_text}"""
 
     async def _on_tool(tool_name: str, tool_input: dict) -> None:
         if tool_name == "record_theme":
             await event_queue.put(SSEEvent(
-                type="theme_discovered", agent="ThemeAgent", data=tool_input,
+                type="theme_discovered",
+                agent="ThemeAgent",
+                data=tool_input,
             ))
 
     raw = await _run_agent_loop(
-        client, "ThemeAgent", theme_agent_system(company), user_msg,
-        THEME_TOOLS, event_queue, cost_tracker=cost_tracker,
+        client, "ThemeAgent", theme_agent_system(company), user_msg, THEME_TOOLS, event_queue,
         on_tool_call=_on_tool,
     )
 
@@ -426,37 +451,27 @@ async def run_feasibility_agent(
     themes: List[Theme],
     company: CompanyContext,
     event_queue: asyncio.Queue,
-    retriever: Optional[AgentRetriever] = None,
-    cost_tracker: Optional[CostTracker] = None,
 ) -> FeasibilityAnalysis:
-    """
-    FeasibilityAgent — rates AI solvability per theme.
-    With RAG: gets theme-specific feedback instead of random 40-item sample.
-    """
     themes_text = json.dumps(
         [{"theme_name": t.theme_name, "description": t.description,
           "frequency": t.frequency_estimate, "segment": t.user_segment}
-         for t in themes], indent=2,
+         for t in themes],
+        indent=2,
     )
 
-    if retriever:
-        sample = retriever.for_feasibility_agent(themes, company, per_theme=8)
-        retrieval_note = "\n\nBELOW: per-theme relevant feedback (RAG-retrieved):\n"
-    else:
-        sample = _feedback_to_text(bundle, max_items=40)
-        retrieval_note = "\n\nSAMPLE FEEDBACK FOR CONTEXT:\n"
+    sample = _feedback_to_text(bundle, max_items=40)
 
-    user_msg = (
-        f"Evaluate AI feasibility for each of the following {len(themes)} user need themes "
-        f"from {company.company_name} feedback.\n"
-        f"Call rate_ai_feasibility for each theme, then emit_feasibility_summary.\n\n"
-        f"THEMES TO EVALUATE:\n{themes_text}"
-        f"{retrieval_note}{sample}"
-    )
+    user_msg = f"""Evaluate AI feasibility for each of the following {len(themes)} user need themes from {company.company_name} feedback.
+Call rate_ai_feasibility for each theme, then emit_feasibility_summary.
+
+THEMES TO EVALUATE:
+{themes_text}
+
+SAMPLE FEEDBACK FOR CONTEXT:
+{sample}"""
 
     raw = await _run_agent_loop(
-        client, "AIFeasibilityAgent", feasibility_agent_system(company), user_msg,
-        FEASIBILITY_TOOLS, event_queue, cost_tracker=cost_tracker,
+        client, "AIFeasibilityAgent", feasibility_agent_system(company), user_msg, FEASIBILITY_TOOLS, event_queue
     )
 
     ratings = [AIFeasibility(**r) for r in raw.get("rate_ai_feasibility", [])]
@@ -474,30 +489,29 @@ async def run_gap_agent(
     themes: List[Theme],
     company: CompanyContext,
     event_queue: asyncio.Queue,
-    cost_tracker: Optional[CostTracker] = None,
 ) -> GapAnalysis:
     themes_text = json.dumps(
         [{"theme_name": t.theme_name, "description": t.description,
           "example_quotes": t.example_quotes[:2]}
-         for t in themes], indent=2,
+         for t in themes],
+        indent=2,
     )
 
-    user_msg = (
-        f"Cross-reference these {len(themes)} user need themes against "
-        f"{company.company_name}'s current feature set.\n"
-        f"For each theme, call record_gap. Also call record_strength for 2-3 "
-        f"things {company.company_name} does well.\nEnd with emit_gap_summary.\n\n"
-        f"USER NEED THEMES:\n{themes_text}"
-    )
+    user_msg = f"""Cross-reference these {len(themes)} user need themes against {company.company_name}'s current feature set.
+For each theme, call record_gap. Also call record_strength for 2-3 things {company.company_name} does well.
+End with emit_gap_summary.
+
+USER NEED THEMES:
+{themes_text}"""
 
     raw = await _run_agent_loop(
-        client, "GapAgent", gap_agent_system(company), user_msg,
-        GAP_TOOLS, event_queue, cost_tracker=cost_tracker,
+        client, "GapAgent", gap_agent_system(company), user_msg, GAP_TOOLS, event_queue
     )
 
     gaps = [
         GapFinding(
-            theme_name=g["theme_name"], gap_type=g["gap_type"],
+            theme_name=g["theme_name"],
+            gap_type=g["gap_type"],
             existing_feature=g.get("existing_feature", ""),
             gap_description=g["gap_description"],
             market_evidence=g.get("market_evidence", ""),
@@ -510,7 +524,8 @@ async def run_gap_agent(
     summary = (raw.get("emit_gap_summary") or [{}])[-1]
 
     return GapAnalysis(
-        gaps=gaps, strengths=strengths,
+        gaps=gaps,
+        strengths=strengths,
         biggest_gap=summary.get("biggest_gap", ""),
         quick_win=summary.get("quick_win", ""),
     )
@@ -521,39 +536,28 @@ async def run_quote_agent(
     bundle: FeedbackBundle,
     company: CompanyContext,
     event_queue: asyncio.Queue,
-    retriever: Optional[AgentRetriever] = None,
-    cost_tracker: Optional[CostTracker] = None,
 ) -> QuoteAnalysis:
-    """
-    QuoteAgent — curates compelling user evidence.
-    With RAG: retrieves emotionally resonant, high-signal quotes.
-    """
-    if retriever:
-        feedback_text = retriever.for_quote_agent(company, max_items=80)
-    else:
-        # Fallback: manual selection
-        reddit_top = sorted(
-            [i for i in bundle.items if i.source == "reddit"],
-            key=lambda x: x.upvotes, reverse=True
-        )[:50]
-        store_items = [i for i in bundle.items if i.source == "app_store"][:20]
-        seed_items = [i for i in bundle.items if i.source == "seed"][:20]
+    reddit_top = sorted(
+        [i for i in bundle.items if i.source == "reddit"],
+        key=lambda x: x.upvotes, reverse=True
+    )[:50]
+    store_items = [i for i in bundle.items if i.source == "app_store"][:20]
+    seed_items = [i for i in bundle.items if i.source == "seed"][:20]
 
-        all_items = reddit_top + store_items + seed_items
-        feedback_text = "\n\n".join(
-            f"[{i.source.upper()}" + (f" +{i.upvotes}" if i.upvotes else "") + f"] {i.text}"
-            for i in all_items
-        )
-
-    user_msg = (
-        f"Mine these {company.company_name} user feedback items for the 15–20 most compelling, "
-        f"quotable statements for a product strategy brief. Call record_power_quote for each, "
-        f"then emit_quote_summary.\n\nFEEDBACK:\n{feedback_text}"
+    all_items = reddit_top + store_items + seed_items
+    feedback_text = "\n\n".join(
+        f"[{i.source.upper()}" + (f" +{i.upvotes}" if i.upvotes else "") + f"] {i.text}"
+        for i in all_items
     )
 
+    user_msg = f"""Mine these {company.company_name} user feedback items for the 15–20 most compelling, quotable statements
+for a product strategy brief. Call record_power_quote for each, then emit_quote_summary.
+
+FEEDBACK:
+{feedback_text}"""
+
     raw = await _run_agent_loop(
-        client, "QuoteAgent", quote_agent_system(company), user_msg,
-        QUOTE_TOOLS, event_queue, cost_tracker=cost_tracker,
+        client, "QuoteAgent", quote_agent_system(company), user_msg, QUOTE_TOOLS, event_queue
     )
 
     quotes = [PowerQuote(**q) for q in raw.get("record_power_quote", [])]
@@ -567,7 +571,7 @@ async def run_quote_agent(
 
 
 # ===========================================================================
-# Orchestrator — extended thinking synthesis (unchanged core logic)
+# Orchestrator — extended thinking synthesis
 # ===========================================================================
 
 async def run_orchestrator(
@@ -579,15 +583,18 @@ async def run_orchestrator(
     gap_analysis: GapAnalysis,
     quote_analysis: QuoteAnalysis,
     event_queue: asyncio.Queue,
-    cost_tracker: Optional[CostTracker] = None,
 ) -> FeatureBrief:
 
-    await event_queue.put(SSEEvent(type="agent_start", agent="Orchestrator"))
+    await event_queue.put(SSEEvent(
+        type="agent_start", agent="Orchestrator",
+    ))
     await event_queue.put(SSEEvent(
         type="phase_start", phase="synthesis",
         message="Orchestrator synthesizing with extended thinking...",
     ))
 
+    # Build a compact context to stay well under rate limits (~8k input tokens max)
+    # Trim descriptions to 1 sentence, limit quotes, cap power_quotes at 10
     def _short(text: str, max_chars: int = 120) -> str:
         return text[:max_chars] + "..." if len(text) > max_chars else text
 
@@ -599,17 +606,31 @@ async def run_orchestrator(
         "biggest_gap": _short(gap_analysis.biggest_gap),
         "quick_win": _short(gap_analysis.quick_win),
         "themes": [
-            {"name": t.theme_name, "freq": t.frequency_estimate, "segment": t.user_segment,
-             "desc": _short(t.description), "quote": t.example_quotes[0] if t.example_quotes else ""}
+            {
+                "name": t.theme_name,
+                "freq": t.frequency_estimate,
+                "segment": t.user_segment,
+                "desc": _short(t.description),
+                "quote": t.example_quotes[0] if t.example_quotes else "",
+            }
             for t in theme_analysis.themes
         ],
         "feasibility": [
-            {"theme": r.theme_name, "score": r.feasibility_score, "approach": _short(r.ai_approach, 100),
-             "complexity": r.technical_complexity, "comparable": r.comparable_product}
+            {
+                "theme": r.theme_name,
+                "score": r.feasibility_score,
+                "approach": _short(r.ai_approach, 100),
+                "complexity": r.technical_complexity,
+                "comparable": r.comparable_product,
+            }
             for r in feasibility.ratings
         ],
         "gaps": [
-            {"theme": g.theme_name, "type": g.gap_type, "gap": _short(g.gap_description, 150)}
+            {
+                "theme": g.theme_name,
+                "type": g.gap_type,
+                "gap": _short(g.gap_description, 150),
+            }
             for g in gap_analysis.gaps
         ],
         "strengths": [
@@ -618,17 +639,16 @@ async def run_orchestrator(
         ],
         "top_quotes": [
             {"text": _short(q.quote_text, 200), "source": q.source, "theme": q.theme}
-            for q in quote_analysis.quotes[:10]
+            for q in quote_analysis.quotes[:10]  # cap at 10 most compelling
         ],
     }
 
-    user_msg = (
-        f"Four research agents analyzed {company.company_name} user feedback. "
-        f"Synthesize into a Feature Opportunity Brief.\n\n"
-        f"Write all 6 sections (write_brief_section), then rank_opportunities, "
-        f"then finalize_brief.\n\nRESEARCH SUMMARY:\n"
-        f"{json.dumps(context, indent=2, ensure_ascii=False)}"
-    )
+    user_msg = f"""Four research agents analyzed {company.company_name} user feedback. Synthesize into a Feature Opportunity Brief.
+
+Write all 6 sections (write_brief_section), then rank_opportunities, then finalize_brief.
+
+RESEARCH SUMMARY:
+{json.dumps(context, indent=2, ensure_ascii=False)}"""
 
     sections: List[BriefSection] = []
     ranked_opportunities: List[RankedOpportunity] = []
@@ -638,7 +658,6 @@ async def run_orchestrator(
 
     while iterations < 15:
         iterations += 1
-        t0 = time.perf_counter()
 
         async with client.messages.stream(
             model=MODEL,
@@ -658,7 +677,9 @@ async def run_orchestrator(
                     thinking_text = getattr(delta, "thinking", "")
                     if thinking_text:
                         await event_queue.put(SSEEvent(
-                            type="thinking_delta", agent="Orchestrator", text=thinking_text,
+                            type="thinking_delta",
+                            agent="Orchestrator",
+                            text=thinking_text,
                         ))
                 elif delta_type == "text_delta":
                     text = getattr(delta, "text", "")
@@ -668,10 +689,6 @@ async def run_orchestrator(
                         ))
 
             final_message = await stream.get_final_message()
-
-        duration_ms = (time.perf_counter() - t0) * 1000
-        if cost_tracker:
-            cost_tracker.record("Orchestrator", final_message, MODEL, duration_ms)
 
         messages.append({"role": "assistant", "content": final_message.content})
 
@@ -688,11 +705,12 @@ async def run_orchestrator(
                 sq = inp.get("supporting_quotes", [])
                 if isinstance(sq, str):
                     try:
-                        sq = json.loads(sq)
+                        import json as _json; sq = _json.loads(sq)
                     except Exception:
                         sq = [sq] if sq else []
                 sections.append(BriefSection(
-                    section_id=inp["section_id"], title=inp["title"],
+                    section_id=inp["section_id"],
+                    title=inp["title"],
                     content=inp["content"],
                     supporting_quotes=sq if isinstance(sq, list) else [],
                 ))
@@ -702,7 +720,8 @@ async def run_orchestrator(
                     tool_input={"section_id": inp["section_id"], "title": inp["title"]},
                 ))
                 tool_results.append({
-                    "type": "tool_result", "tool_use_id": block.id,
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
                     "content": f"Section '{inp['section_id']}' recorded.",
                 })
 
@@ -710,18 +729,20 @@ async def run_orchestrator(
                 for opp in block.input.get("opportunities", []):
                     try:
                         if isinstance(opp, str):
-                            opp = json.loads(opp)
+                            import json as _json
+                            opp = _json.loads(opp)
                         if isinstance(opp, dict):
                             ranked_opportunities.append(RankedOpportunity(**opp))
                     except Exception as e:
-                        logger.warning(f"Skipping malformed opportunity: {e}")
+                        logger.warning(f"Skipping malformed opportunity: {e} — {opp!r}")
                 await event_queue.put(SSEEvent(
                     type="agent_tool_call", agent="Orchestrator",
                     tool="rank_opportunities",
                     tool_input={"count": len(block.input.get("opportunities", []))},
                 ))
                 tool_results.append({
-                    "type": "tool_result", "tool_use_id": block.id,
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
                     "content": "Opportunities ranked.",
                 })
 
@@ -732,7 +753,8 @@ async def run_orchestrator(
                     tool="finalize_brief", tool_input={},
                 ))
                 tool_results.append({
-                    "type": "tool_result", "tool_use_id": block.id,
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
                     "content": "Brief finalized.",
                 })
 
@@ -743,7 +765,7 @@ async def run_orchestrator(
 
     full_md = _assemble_markdown(
         sections, ranked_opportunities, final_data,
-        bundle, theme_analysis, gap_analysis, company,
+        bundle, theme_analysis, gap_analysis
     )
 
     brief = FeatureBrief(
@@ -772,7 +794,7 @@ async def run_orchestrator(
 
 
 # ===========================================================================
-# Full pipeline entry point — now with RAG + cost tracking
+# Full pipeline entry point
 # ===========================================================================
 
 async def run_pipeline(
@@ -781,69 +803,33 @@ async def run_pipeline(
     company: CompanyContext,
     event_queue: asyncio.Queue,
 ) -> FeatureBrief:
-    """
-    Main pipeline entry point.
 
-    New in v2: builds a FeedbackVectorStore from the bundle, creates an
-    AgentRetriever, and passes it to all agents for RAG-based retrieval.
-    Tracks costs per agent via CostTracker.
-    """
-
-    cost_tracker = CostTracker()
-    retrieval_metrics = RetrievalMetrics()
-
-    # ── Build vector store (RAG) ──────────────────────────────────────
-    await event_queue.put(SSEEvent(
-        type="progress",
-        message=f"Building vector index over {bundle.total} feedback items...",
-    ))
-
-    try:
-        vector_store = build_vector_store(bundle)
-        retriever = AgentRetriever(vector_store, retrieval_metrics)
-        await event_queue.put(SSEEvent(
-            type="progress",
-            message=f"Vector index ready: {vector_store.size} items, "
-                    f"{vector_store.vectors.shape[1]} features "
-                    f"({vector_store._index_time_ms:.0f}ms)",
-        ))
-    except Exception as e:
-        logger.warning(f"RAG indexing failed, falling back to raw: {e}")
-        retriever = None
-
-    # ── Wave 1: ThemeAgent + QuoteAgent ───────────────────────────────
     await event_queue.put(SSEEvent(
         type="phase_start", phase="wave1",
         message=f"Launching Wave 1 agents on {bundle.total} {company.company_name} feedback items...",
     ))
 
+    # Wave 1: ThemeAgent + QuoteAgent run in parallel — neither depends on the other
     theme_analysis, quote_analysis = await asyncio.gather(
-        run_theme_agent(client, bundle, company, event_queue, retriever, cost_tracker),
-        run_quote_agent(client, bundle, company, event_queue, retriever, cost_tracker),
+        run_theme_agent(client, bundle, company, event_queue),
+        run_quote_agent(client, bundle, company, event_queue),
     )
 
     await event_queue.put(SSEEvent(
         type="phase_complete", phase="wave1",
-        message=f"Wave 1 complete: {len(theme_analysis.themes)} themes, "
-                f"{len(quote_analysis.quotes)} quotes. Launching Wave 2...",
-        data={"theme_count": len(theme_analysis.themes),
-              "quote_count": len(quote_analysis.quotes)},
+        message=f"Wave 1 complete: {len(theme_analysis.themes)} themes, {len(quote_analysis.quotes)} quotes. Launching Wave 2...",
+        data={"theme_count": len(theme_analysis.themes), "quote_count": len(quote_analysis.quotes)},
     ))
 
-    # ── Wave 2: FeasibilityAgent + GapAgent ───────────────────────────
     await event_queue.put(SSEEvent(
         type="phase_start", phase="wave2",
         message="Running AI Feasibility & Gap Analysis in parallel...",
     ))
 
+    # Wave 2: FeasibilityAgent + GapAgent — both require theme output from Wave 1
     feasibility, gap_analysis = await asyncio.gather(
-        run_feasibility_agent(
-            client, bundle, theme_analysis.themes, company, event_queue,
-            retriever, cost_tracker,
-        ),
-        run_gap_agent(
-            client, theme_analysis.themes, company, event_queue, cost_tracker,
-        ),
+        run_feasibility_agent(client, bundle, theme_analysis.themes, company, event_queue),
+        run_gap_agent(client, theme_analysis.themes, company, event_queue),
     )
 
     await event_queue.put(SSEEvent(
@@ -857,43 +843,11 @@ async def run_pipeline(
         },
     ))
 
-    # ── Orchestrator synthesis ────────────────────────────────────────
     brief = await run_orchestrator(
-        client, bundle, company, theme_analysis, feasibility,
-        gap_analysis, quote_analysis, event_queue, cost_tracker,
+        client, bundle, company, theme_analysis, feasibility, gap_analysis, quote_analysis, event_queue
     )
 
-    # ── Emit cost + retrieval metrics via SSE ─────────────────────────
-    cost_summary = cost_tracker.summary()
-    retrieval_summary = retrieval_metrics.summary()
-
-    await event_queue.put(SSEEvent(
-        type="pipeline_metrics",
-        data={
-            "cost": cost_summary,
-            "retrieval": retrieval_summary,
-        },
-    ))
-
-    # Attach metrics to brief for eval framework
-    brief._cost_summary = cost_summary
-    brief._retrieval_metrics = retrieval_metrics
-
     return brief
-
-
-# ===========================================================================
-# Legacy fallback (when RAG is not available)
-# ===========================================================================
-
-def _feedback_to_text(bundle: FeedbackBundle, max_items: int = 120) -> str:
-    """Serialize feedback items into a compact string for Claude context."""
-    lines = []
-    sorted_items = sorted(bundle.items, key=lambda x: x.upvotes, reverse=True)
-    for item in sorted_items[:max_items]:
-        prefix = f"[{item.source.upper()}" + (f" +{item.upvotes}" if item.upvotes else "") + "] "
-        lines.append(prefix + item.text)
-    return "\n\n".join(lines)
 
 
 # ===========================================================================
@@ -907,11 +861,9 @@ def _assemble_markdown(
     bundle: FeedbackBundle,
     theme_analysis: ThemeAnalysis,
     gap_analysis: GapAnalysis,
-    company: CompanyContext = None,
 ) -> str:
-    title = f"{company.company_name} AI Feature Opportunity Brief" if company else "AI Feature Opportunity Brief"
     lines = [
-        f"# {title}",
+        "# Duolingo AI Feature Opportunity Brief",
         f"> *Generated {datetime.utcnow().strftime('%B %d, %Y')} · "
         f"{bundle.total} feedback items analyzed "
         f"({bundle.reddit_count} Reddit · {bundle.app_store_count} App Store · {bundle.seed_count} seed)*",
@@ -919,7 +871,12 @@ def _assemble_markdown(
     ]
 
     if final_data.get("headline_insight"):
-        lines += ["## Headline Finding", "", f"> {final_data['headline_insight']}", ""]
+        lines += [
+            "## Headline Finding",
+            "",
+            f"> {final_data['headline_insight']}",
+            "",
+        ]
 
     if final_data.get("top_3_insights"):
         lines += ["## Top 3 Insights", ""]
@@ -932,11 +889,14 @@ def _assemble_markdown(
         for opp in opportunities:
             lines += [
                 f"### #{opp.rank} — {opp.feature_name}",
-                f"*{opp.one_liner}*", "",
+                f"*{opp.one_liner}*",
+                "",
                 f"- **Evidence:** {opp.evidence_strength}",
                 f"- **AI uniqueness:** {opp.ai_uniqueness}",
-                f"- **Effort:** {opp.effort_estimate.replace('_', ' ')}", "",
-                f"> \"{opp.supporting_quote}\"", "",
+                f"- **Effort:** {opp.effort_estimate.replace('_', ' ')}",
+                "",
+                f"> \"{opp.supporting_quote}\"",
+                "",
             ]
 
     for section in sections:
@@ -950,4 +910,3 @@ def _assemble_markdown(
         lines += ["## Recommended Next Step", "", final_data["call_to_action"], ""]
 
     return "\n".join(lines)
-

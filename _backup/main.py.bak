@@ -1,5 +1,5 @@
 """
-FastAPI backend — SSE streaming, pipeline orchestration, eval endpoints.
+FastAPI backend — SSE streaming, pipeline orchestration, static file serving.
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend.agents import run_pipeline
-from backend.evals import EvalSuite
 from backend.models import CompanyContext, FeatureBrief, FeedbackBundle, SSEEvent
+from backend.scraper import fetch_bundle
 
 load_dotenv()
 logging.basicConfig(
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Feature Intelligence", version="2.1.0")
+app = FastAPI(title="Duolingo Feature Intelligence", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -81,14 +81,14 @@ async def index():
     path = FRONTEND_DIR / "index.html"
     if path.exists():
         return FileResponse(str(path))
-    return {"message": "Feature Intelligence API — set ANTHROPIC_API_KEY and open /docs"}
+    return {"message": "Duolingo Feature Intelligence API — set ANTHROPIC_API_KEY and open /docs"}
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def start_analysis(request: AnalyzeRequest):
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set in environment")
 
     company = CompanyContext(
         company_name=request.company_name.strip() or "Duolingo",
@@ -104,7 +104,6 @@ async def start_analysis(request: AnalyzeRequest):
     runs[run_id] = {
         "queue": queue,
         "brief": None,
-        "bundle": None,
         "status": "starting",
         "company": company,
     }
@@ -149,6 +148,7 @@ async def get_brief(run_id: str):
     run = runs.get(run_id)
     if run and run.get("brief"):
         return run["brief"].model_dump(mode="json")
+    # Try loading from disk
     brief_path = BRIEFS_DIR / f"{run_id}.json"
     if brief_path.exists():
         return json.loads(brief_path.read_text())
@@ -174,78 +174,6 @@ async def get_status(run_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Cost endpoint
-# ---------------------------------------------------------------------------
-
-@app.get("/cost/{run_id}")
-async def get_cost(run_id: str):
-    """Return API cost breakdown for a completed run."""
-    run = runs.get(run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
-
-    brief = run.get("brief")
-    if not brief:
-        raise HTTPException(status_code=425, detail="Analysis not complete yet")
-
-    cost_summary = getattr(brief, "_cost_summary", None)
-    if not cost_summary:
-        raise HTTPException(status_code=404, detail="Cost data not available")
-
-    return cost_summary
-
-
-# ---------------------------------------------------------------------------
-# Eval endpoint
-# ---------------------------------------------------------------------------
-
-@app.post("/eval/{run_id}")
-async def run_eval(run_id: str, stability: bool = False):
-    """
-    Run the evaluation suite on a completed analysis.
-
-    Args:
-        stability: If true, runs the slow theme stability eval (3x theme agent).
-    """
-    run = runs.get(run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
-
-    brief = run.get("brief")
-    bundle = run.get("bundle")
-    company = run.get("company")
-    if not brief or not bundle:
-        raise HTTPException(status_code=425, detail="Analysis not complete yet")
-
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set")
-
-    client = anthropic.AsyncAnthropic(api_key=api_key)
-    suite = EvalSuite(client)
-
-    retrieval_metrics = getattr(brief, "_retrieval_metrics", None)
-
-    result = await suite.run(
-        brief=brief,
-        bundle=bundle,
-        company=company,
-        retrieval_metrics=retrieval_metrics,
-        run_id=run_id,
-        run_stability_eval=stability,
-    )
-
-    return result.model_dump(mode="json")
-
-
-@app.get("/eval/history")
-async def eval_history(company: str = "", limit: int = 20):
-    """Return historical eval results for trend analysis."""
-    results = EvalSuite.load_history(company, limit)
-    return [r.model_dump(mode="json") for r in results]
-
-
-# ---------------------------------------------------------------------------
 # Background pipeline task
 # ---------------------------------------------------------------------------
 
@@ -261,15 +189,10 @@ async def _pipeline_task(run_id: str, api_key: str, company: CompanyContext):
             message=f"Fetching {company.company_name} feedback from Reddit and App Store...",
         ))
 
-        from backend.scraper import fetch_bundle
-
         async def progress_cb(msg: str):
             await queue.put(SSEEvent(type="progress", message=msg))
 
         bundle: FeedbackBundle = await fetch_bundle(company=company, progress_cb=progress_cb)
-
-        # Store bundle for eval endpoint
-        runs[run_id]["bundle"] = bundle
 
         await queue.put(SSEEvent(
             type="phase_complete", phase="fetching",
@@ -284,7 +207,7 @@ async def _pipeline_task(run_id: str, api_key: str, company: CompanyContext):
             },
         ))
 
-        # Phase 2: Agent pipeline (now with RAG + cost tracking)
+        # Phase 2: Agent pipeline
         runs[run_id]["status"] = "analyzing"
         brief = await run_pipeline(client, bundle, company, queue)
         runs[run_id]["brief"] = brief
@@ -307,5 +230,4 @@ async def _pipeline_task(run_id: str, api_key: str, company: CompanyContext):
         runs[run_id]["status"] = "error"
         await queue.put(SSEEvent(type="error", error=str(e)))
     finally:
-        await queue.put(None)
-
+        await queue.put(None)  # sentinel — closes SSE stream
